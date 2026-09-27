@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>星载载荷固件签封审计</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+         margin: 0 auto; max-width: 1080px; padding: 1.5rem; line-height: 1.5; }
+  h1 { font-size: 1.4rem; }
+  label { display: block; font-weight: 600; margin-top: 1rem; }
+  input[type=text], textarea { width: 100%; box-sizing: border-box;
+         font-family: ui-monospace, monospace; font-size: .85rem;
+         padding: .5rem; border: 1px solid #888; border-radius: 6px;
+         background: Canvas; color: CanvasText; }
+  textarea { min-height: 9rem; }
+  button { margin-top: .8rem; margin-right: .6rem; padding: .55rem 1.2rem;
+         border: 0; border-radius: 6px; cursor: pointer; font-size: .95rem; }
+  #submitBtn { background: #1a6fd4; color: #fff; }
+  #queryBtn { background: #5a5a5a; color: #fff; }
+  #health { font-size: .85rem; opacity: .8; }
+  .banner { margin-top: 1.2rem; padding: .8rem 1rem; border-radius: 8px;
+         font-weight: 700; }
+  .pass { background: #d9f2e3; color: #14532d; }
+  .fail { background: #fbe0e0; color: #7f1d1d; }
+  .note { font-weight: 400; font-size: .9rem; margin-top: .3rem; }
+  table { border-collapse: collapse; width: 100%; margin-top: .6rem;
+         font-size: .8rem; }
+  th, td { border: 1px solid #9995; padding: .3rem .5rem; text-align: left;
+         word-break: break-all; }
+  th { background: #8882; }
+  td.mono { font-family: ui-monospace, monospace; }
+  .ok { color: #15803d; font-weight: 700; }
+  .bad { color: #b91c1c; font-weight: 700; }
+  section { margin-top: 1.6rem; }
+  h2 { font-size: 1.05rem; border-bottom: 2px solid #8885; padding-bottom: .2rem; }
+  #error { color: #b91c1c; font-weight: 600; margin-top: 1rem; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h1>星载载荷固件签封审计 <span id="health">（健康状态查询中…）</span></h1>
+<p>粘贴不超过 2 MiB 的 Base64 Mach-O 切片与稳定审计标识。系统仅接受单个大端
+SuperBlob 中的 SHA-256 CodeDirectory，严格校验长度、索引、偏移、哈希槽边界与
+codeLimit，并按声明页长逐页复算代码槽。</p>
+
+<label for="auditId">审计标识（稳定、唯一）</label>
+<input type="text" id="auditId" placeholder="例如 fw-2026-09-slotA" maxlength="128">
+
+<label for="payload">Base64 Mach-O 切片（≤ 2 MiB）</label>
+<textarea id="payload" placeholder="粘贴 Base64…"></textarea>
+
+<div>
+  <button id="submitBtn">提交审计</button>
+  <button id="queryBtn">查询既有审计</button>
+</div>
+<div id="error"></div>
+<div id="result"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+async function refreshHealth() {
+  try {
+    const r = await fetch("/health");
+    const j = await r.json();
+    $("health").textContent = `（服务正常 · 已冻结审计 ${j.audits} 份）`;
+  } catch (e) {
+    $("health").textContent = "（健康状态不可用）";
+  }
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, c =>
+    ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+}
+
+function summaryTable(cd) {
+  const rows = [
+    ["标识 ident", cd.ident], ["版本", cd.version], ["flags", cd.flags],
+    ["散列类型", cd.hash_type], ["散列槽长", cd.hash_size + " 字节"],
+    ["页指数", "2^" + cd.page_exponent], ["页大小", cd.page_size + " 字节"],
+    ["特殊槽数", cd.n_special_slots], ["代码槽数", cd.n_code_slots],
+    ["codeLimit", cd.code_limit], ["hashOffset", cd.hash_offset],
+    ["CodeDirectory 长度", cd.cd_length],
+    ["SuperBlob 长度", cd.superblob_length],
+    ["签名区偏移", cd.signature_offset], ["签名区大小", cd.signature_size],
+  ];
+  return "<table>" + rows.map(([k, v]) =>
+    `<tr><th>${esc(k)}</th><td class="mono">${esc(v)}</td></tr>`).join("") + "</table>";
+}
+
+function pagesTable(pages) {
+  const head = "<tr><th>槽号</th><th>偏移</th><th>长度</th>" +
+    "<th>期望摘要</th><th>实算摘要</th><th>结论</th></tr>";
+  const body = pages.map(p =>
+    `<tr><td>${p.slot}</td><td class="mono">${p.offset}</td>` +
+    `<td>${p.length}</td><td class="mono">${esc(p.expected_sha256)}</td>` +
+    `<td class="mono">${esc(p.actual_sha256)}</td>` +
+    (p.match ? '<td class="ok">一致</td>' : '<td class="bad">不符</td>') +
+    "</tr>").join("");
+  return `<table>${head}${body}</table>`;
+}
+
+function render(audit, created) {
+  $("error").textContent = "";
+  const pass = audit.verdict === "pass";
+  let html = `<div class="banner ${pass ? "pass" : "fail"}">` +
+    `冻结结论：${pass ? "通过" : "未通过"}` +
+    `<div class="note">审计标识 ${esc(audit.audit_id)} · ` +
+    `载荷 SHA-256 <span class="mono">${esc(audit.payload_sha256)}</span> · ` +
+    `${audit.payload_size} 字节 · 冻结于 ${esc(audit.created_at)}` +
+    (created === false ? " · 幂等重放（返回原审计）" : "") + "</div>";
+  if (audit.reason) html += `<div class="note">失败原因：${esc(audit.reason)}</div>`;
+  if (audit.first_failing_slot !== null && audit.first_failing_slot !== undefined)
+    html += `<div class="note">首个失败槽：${audit.first_failing_slot}</div>`;
+  html += "</div>";
+  if (audit.code_directory) {
+    html += `<section><h2>代码目录摘要</h2>${summaryTable(audit.code_directory)}</section>`;
+    const c = audit.coverage;
+    html += `<section><h2>代码覆盖范围</h2><table>` +
+      `<tr><th>起始</th><td class="mono">${c.start}</td></tr>` +
+      `<tr><th>结束（codeLimit）</th><td class="mono">${c.end}</td></tr>` +
+      `<tr><th>页大小</th><td class="mono">${c.page_size} 字节</td></tr>` +
+      `<tr><th>覆盖页数</th><td class="mono">${c.n_pages}</td></tr>` +
+      `</table></section>`;
+    html += `<section><h2>按页升序摘要比对证据（共 ${audit.pages.length} 页）</h2>` +
+      pagesTable(audit.pages) + "</section>";
+  }
+  $("result").innerHTML = html;
+}
+
+function showError(msg) {
+  $("result").innerHTML = "";
+  $("error").textContent = msg;
+}
+
+$("submitBtn").onclick = async () => {
+  const audit_id = $("auditId").value.trim();
+  const payload_b64 = $("payload").value;
+  try {
+    const r = await fetch("/api/audits", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({audit_id, payload_b64}),
+    });
+    const j = await r.json();
+    if (r.status === 200 || r.status === 201) {
+      render(j.audit, j.created);
+    } else if (r.status === 409) {
+      showError(`冲突：${j.message}\n既有载荷摘要：${j.existing_payload_sha256}` +
+                `\n提交载荷摘要：${j.submitted_payload_sha256}`);
+    } else {
+      showError(`错误（${r.status}）：${j.message || j.error}`);
+    }
+  } catch (e) { showError("请求失败：" + e); }
+  refreshHealth();
+};
+
+$("queryBtn").onclick = async () => {
+  const id = $("auditId").value.trim();
+  try {
+    const r = await fetch("/api/audits/" + encodeURIComponent(id));
+    const j = await r.json();
+    if (r.status === 200) render(j.audit, undefined);
+    else showError(`错误（${r.status}）：${j.message || j.error}`);
+  } catch (e) { showError("请求失败：" + e); }
+};
+
+refreshHealth();
+</script>
+</body>
+</html>
